@@ -66,7 +66,6 @@ TODO: Complete Semantics section
 import abc
 import re
 import enum
-import pickle
 import typing
 
 
@@ -135,7 +134,9 @@ def index_to_location_token(index):
 class Options:
     __slots__ = (
         'L1b_mode', 'allow_two_character_ge', 'allow_non_integer_programs',
-        'assign_returns_new_value', 'seq_allows_non_unit'
+        'assign_returns_new_value', 'seq_allows_non_unit',
+        'allow_assignment_to_create_new_location',
+        'all_locations_implicitly_zero'
     )
 
     def __init__(self, other=None):
@@ -145,12 +146,16 @@ class Options:
             self.allow_non_integer_programs = other.allow_non_integer_programs
             self.assign_returns_new_value = other.assign_returns_new_value
             self.seq_allows_non_unit = other.seq_allows_non_unit
+            self.allow_assignment_to_create_new_location = other.allow_assignment_to_create_new_location
+            self.all_locations_implicitly_zero = other.all_locations_implicitly_zero
             return
         self.L1b_mode = False
         self.allow_two_character_ge = True
         self.allow_non_integer_programs = True
         self.assign_returns_new_value = False
         self.seq_allows_non_unit = False
+        self.allow_assignment_to_create_new_location = False
+        self.all_locations_implicitly_zero = False
 
 
 class State:
@@ -188,6 +193,9 @@ class State:
         if item not in self.mappings:
             raise ValueError(f'Tried to access (write {value}) location {index_to_location_token(item)} when there is no such location') from None
         self.mappings[item] = value
+
+    def __contains__(self, item):
+        return item in self.mappings
 
     def copy(self):
         return State(self)
@@ -291,6 +299,8 @@ class Expression(abc.ABC):
             except_ = frozenset()
         if allow_types is None:
             allow_types = frozenset(Type.__members__.values())
+        if not allow_types:
+            return None  # No allowed types
         for subclass in Expression._subclasses:
             if subclass in except_:
                 continue
@@ -636,10 +646,8 @@ class Conditional(Expression):
         super().__init__(options)
         if condition.get_type() is not Type.BOOLEAN:
             raise TypeError(f'Conditional condition (if {condition!r} then if_true else if_false) should be of type BOOLEAN')
-        if if_true.get_type() is not Type.UNIT:
-            raise TypeError(f'Conditional if_true (if condition then {if_true!r} else if_false) should be of type UNIT')
-        if if_false.get_type() is not Type.UNIT:
-            raise TypeError(f'Conditional if_false (if condition then if_true else {if_false!r}) should be of type UNIT')
+        if if_true.get_type() is not if_false.get_type():
+            raise TypeError(f'Conditional if_true and if_false (if condition then {if_true!r} else {if_false!r}) should be of the same type')
         self.condition = condition
         self.if_true = if_true
         self.if_false = if_false
@@ -655,8 +663,6 @@ class Conditional(Expression):
 
     @classmethod
     def parse(cls, source, start_index, except_, allow_types, options):
-        if Type.UNIT not in allow_types:
-            return None
         start_index = _skip_spaces(source, start_index)
         if source[start_index: start_index + 2] != 'if':
             return None
@@ -666,13 +672,13 @@ class Conditional(Expression):
         condition, start_index = condition
         if source[start_index: start_index + 4] != 'then':
             return None
-        if_true = Expression.parse(source, start_index + 4, None, {Type.UNIT}, options)
+        if_true = Expression.parse(source, start_index + 4, None, allow_types, options)
         if if_true is None:
             return None
         if_true, start_index = if_true
         if source[start_index: start_index + 4] != 'else':
             return None
-        if_false = Expression.parse(source, start_index + 4, None, {Type.UNIT}, options)
+        if_false = Expression.parse(source, start_index + 4, None, {if_true.get_type()}, options)
         if if_false is None:
             return None
         if_false, start_index = if_false
@@ -691,7 +697,7 @@ class Conditional(Expression):
         return f'if {self.condition} then {self.if_true} else {self.if_false}'
 
     def get_type(self):
-        return Type.UNIT
+        return self.if_true.get_type()
 
     def __eq__(self, other):
         eq = super().__eq__(other)
@@ -730,7 +736,11 @@ class Assignment(Expression):
         if type(value) is not Integer:
             value, s = value.step(s)
             return Assignment(location, value, self.options), s  # (assign2)
-        return Skip(self.options), s + (location.value, value.value)  # (assign1)
+        l = location.value
+        if not self.options.allow_assignment_to_create_new_location and l not in s:
+            s[l] = value.value  # Throw error
+            assert False
+        return Skip(self.options), s + (l, value.value)  # (assign1)
 
     @classmethod
     def parse(cls, source, start_index, except_, allow_types, options):
@@ -792,7 +802,10 @@ class Dereference(Expression):
             # Never happens normally (location should be a fixed Location)
             location, s = location.step(s)
             return Dereference(location, self.options), s
-        return Integer(s[location.value], self.options), s  # (deref)
+        l = location.value
+        if self.options.all_locations_implicitly_zero and l not in s:
+            return Integer(0, self.options), s
+        return Integer(s[l], self.options), s  # (deref)
 
     @classmethod
     def parse(cls, source, start_index, except_, allow_types, options):
