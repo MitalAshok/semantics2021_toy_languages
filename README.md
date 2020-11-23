@@ -18,7 +18,7 @@ You should use a file like `example.L1`:
 
 ```
 l -> 1234, l0 -> -134, l1 -> 123
-l + l0 + l1
+!l + !l0 + !l1
 ```
 
 Where the first line is the initial mappings, and any subsequent lines an L1 expression.
