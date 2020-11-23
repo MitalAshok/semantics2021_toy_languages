@@ -3,7 +3,7 @@ __credits__ = [
     'Mital Ashok <ma880@cam.ac.uk>',
 ]
 __license__ = None  # Have not decided yet
-__version__ = '1.0.1'
+__version__ = '1.1.0'
 __maintainer__ = 'Mital Ashok'
 __author_email__ = __email__ = 'ma880@cam.ac.uk'
 __status__ = 'Development'

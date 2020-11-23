@@ -13,7 +13,8 @@ def main(argv=None):
     parser.add_argument('-x', '--lang', choices={'L1', 'L1b'}, default=None, help='The language to run the file as. Default to guess from the file extension (.l1 -> L1, .l1b -> L1b)')
     parser.add_argument('-z', '--zero', action='store_true', help='Initially set all locations accessed to 0')
     parser.add_argument('-s', '--steps', action='store_true', help='Show all the steps of derivation')
-    parser.add_argument('--repr', action='store_true', help='Show a (Python) representation of the program before doing anything else')
+    parser.add_argument('--eval-assignment', action='store_true', help='Evaluate l := n as n instead of skip')
+    parser.add_argument('--repr', action='store_true', help='Show Python, Java and ML representation of the program before doing anything else')
 
     parsed = parser.parse_args(argv)
     file = parsed.file
@@ -21,6 +22,7 @@ def main(argv=None):
     print_repr = parsed.repr
     steps = parsed.steps
     zero = parsed.zero
+    eval_assignment = parsed.eval_assignment
 
     if lang is None:
         flower = file.lower()
@@ -50,7 +52,14 @@ def main(argv=None):
         options = L1.Options()
         if lang == 'L1B':
             options.L1b_mode = True
-        e, s = L1.parse_source(source, zero, options)
+        if zero:
+            options.all_locations_implicitly_zero = True
+        if eval_assignment:
+            options.assign_returns_new_value = True
+            options.seq_allows_non_unit = True
+
+        e, s = L1.parse_source(source, options)
+        T = e.type_check(s)
         if print_repr:
             print('Python:')
             print(repr(e))
@@ -59,6 +68,10 @@ def main(argv=None):
             print(L1.to_ml(e, s))
             print('Java:')
             print(L1.to_java(e, s), flush=True)
+            if T is not None:
+                print(f'\nThis program has type {T.name}', flush=True)
+        if T is None:
+            raise ValueError('Program does not Type check')
         if steps:
             try:
                 e.print_steps(s)

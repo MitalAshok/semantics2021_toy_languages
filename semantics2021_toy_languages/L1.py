@@ -132,11 +132,52 @@ def index_to_location_token(index):
 
 
 class Options:
+    """A collection of options when interpreting an L1 program
+
+    L1b_mode  (default: False)
+        If True, use L1b instead of L1, by evaluating the right
+        of operators first (Use (op1b) and (op2b) instead of (op1) and (op2)
+        Only effects stepping / running
+
+    allow_non_integer_programs  (default: True)
+        If False, the only expression allowed as a complete program
+        must have type INTEGER
+
+    allow_two_character_ge  (default: True)
+        Allow the usage of ">=" instead of "≥" during parsing.
+        Only affects parse() and create()
+
+    assign_returns_new_value  (default: False)
+        If True, the type of an assignment expression is INTEGER, and the
+        value is the value that was assigned. It changes the rule (assign1)
+        to (assign'1), so that ⟨l := n, {l ↦ x}⟩ -> ⟨n, {l ↦ n}⟩.
+        Should set seq_allows_non_unit to True if this is True
+
+    seq_allows_non_unit  (default: False)
+        If True, allows the left side of a sequence to be of non-unit type,
+        by changing the rule (seq1) to (seq1')
+
+    all_locations_implicitly_zero  (default: False)
+        If True, when trying to dereference a location not in the store,
+        0 will be returned, and assignment is allowed to locations not in
+        the store.
+
+        Adds two rules:
+
+        ⟨𝑙 := 𝑒, s⟩ -> ⟨𝑙 := 𝑒, s ∪ {𝑙 ↦ 0}⟩  if 𝑙 ∉ dom(s)    (assign')
+        ⟨!𝑙, s⟩ -> ⟨!𝑙, s ∪ {𝑙 ↦ 0}⟩  if 𝑙 ∉ dom(s)    (deref')
+
+        And type checks under the assumption of dom(Γ) = 𝕃
+
+    allow_conditional_locations  (default: False)
+        Allows the body of conditionals to have locations
+    """
     __slots__ = (
-        'L1b_mode', 'allow_two_character_ge', 'allow_non_integer_programs',
+        'L1b_mode',
+        'allow_two_character_ge', 'allow_non_integer_programs',
         'assign_returns_new_value', 'seq_allows_non_unit',
-        'allow_assignment_to_create_new_location',
-        'all_locations_implicitly_zero'
+        'all_locations_implicitly_zero',
+        'allow_conditional_locations'
     )
 
     def __init__(self, other=None):
@@ -145,17 +186,17 @@ class Options:
             self.allow_two_character_ge = other.allow_two_character_ge
             self.allow_non_integer_programs = other.allow_non_integer_programs
             self.assign_returns_new_value = other.assign_returns_new_value
-            self.seq_allows_non_unit = other.seq_allows_non_unit
-            self.allow_assignment_to_create_new_location = other.allow_assignment_to_create_new_location
             self.all_locations_implicitly_zero = other.all_locations_implicitly_zero
+            self.seq_allows_non_unit = other.seq_allows_non_unit
+            self.allow_conditional_locations = other.allow_conditional_locations
             return
         self.L1b_mode = False
         self.allow_two_character_ge = True
         self.allow_non_integer_programs = True
         self.assign_returns_new_value = False
-        self.seq_allows_non_unit = False
-        self.allow_assignment_to_create_new_location = False
         self.all_locations_implicitly_zero = False
+        self.seq_allows_non_unit = False
+        self.allow_conditional_locations = False
 
 
 class State:
@@ -261,7 +302,7 @@ class Expression(abc.ABC):
         raise NotImplementedError()
 
     @staticmethod
-    def create(source: str, allow_any_type=True, options : Options = Options()) -> 'Expression':
+    def create(source: str, options : Options = Options()) -> 'Expression':
         """
         Parses an Expression and returns the result
 
@@ -276,7 +317,7 @@ class Expression(abc.ABC):
         Without this extension, only INTEGER types are allowed as a top-level
         expression
         """
-        e = Expression.parse(source, 0, None, None if allow_any_type else {Type.INTEGER}, options)
+        e = Expression.parse(source, 0, None, None if options.allow_non_integer_programs else {Type.INTEGER}, options)
         if e is None:
             raise ValueError(f'Could not parse {source!r} as an expression')
         e, index = e
@@ -380,21 +421,28 @@ class Expression(abc.ABC):
     def visit(self, f):
         f(self)
 
+    @abc.abstractmethod
+    def type_check(self, s: State) -> typing.Optional[Type]:
+        """Like get_type() but also checks if this progam will type check, and returns None otherwise"""
+        raise NotImplementedError()
+
 
 class Seq(Expression):
     __slots__ = 'left', 'right'
 
     def __init__(self, left: Expression, right: Expression, options: Options):
         super().__init__(options)
+        if not options.seq_allows_non_unit and left.get_type() is not Type.UNIT:
+            raise ValueError(f'Seq left ({self.left!r}; right) should be of type UNIT')
         self.left = left
         self.right = right
 
     def step(self, s):
-        if type(self.left) == Skip:
+        if type(self.left) is Skip:
             return self.right, s  # (seq1)
         if type(self.left) in (Integer, Boolean, Location):
             if self.options.seq_allows_non_unit:
-                return self.right, s  # (seq1)
+                return self.right, s  # (seq1')
             else:
                 raise RuntimeError(f'Seq left ({self.left!r}; right) should be of type UNIT')
         e, s = self.left.step(s)
@@ -402,7 +450,7 @@ class Seq(Expression):
 
     @classmethod
     def parse(cls, source, start_index, except_, allow_types, options):
-        left = Expression.parse(source, start_index, except_, {Type.UNIT}, options)
+        left = Expression.parse(source, start_index, except_, None if options.seq_allows_non_unit else {Type.UNIT}, options)
         if left is None:
             return None
         left, start_index = left
@@ -439,6 +487,12 @@ class Seq(Expression):
         super().visit(f)
         self.left.visit(f)
         self.right.visit(f)
+
+    def type_check(self, s):
+        left_type = self.left.type_check(s)
+        if not self.options.seq_allows_non_unit and left_type is not Type.UNIT:
+            return None
+        return self.right.type_check(s)
 
 
 class Boolean(Expression):
@@ -484,6 +538,9 @@ class Boolean(Expression):
             return self.value is other.value
         return eq
 
+    def type_check(self, s):
+        return Type.BOOLEAN
+
 
 class Integer(Expression):
     __slots__ = 'value'
@@ -527,6 +584,9 @@ class Integer(Expression):
         if eq is True:
             return self.value is other.value
         return eq
+
+    def type_check(self, s):
+        return Type.INTEGER
 
 
 class Operation(Expression):
@@ -617,7 +677,7 @@ class Operation(Expression):
         return f'new {op}({self.left.java_repr()}, {self.right.java_repr()})'
 
     def __str__(self):
-        op = '+' if self.op == Operation.Operations.plus else '≥'
+        op = '+' if self.op is Operation.Operations.plus else '≥'
         return f'{self.left} {op} {self.right}'
 
     def get_type(self):
@@ -637,6 +697,11 @@ class Operation(Expression):
         super().visit(f)
         self.left.visit(f)
         self.right.visit(f)
+
+    def type_check(self, s):
+        if self.left.type_check(s) is not Type.INTEGER or self.right.type_check(s) is not Type.INTEGER:
+            return None
+        return Type.INTEGER if self.op is Operation.Operations.plus else Type.BOOLEAN
 
 
 class Conditional(Expression):
@@ -711,6 +776,16 @@ class Conditional(Expression):
         self.if_true.visit(f)
         self.if_false.visit(f)
 
+    def type_check(self, s):
+        if self.condition.type_check(s) is not Type.BOOLEAN:
+            return None
+        true_type = self.if_true.type_check(s)
+        if not self.options.allow_conditional_locations and true_type is Type.LOCATION:
+            return None
+        if true_type is not self.if_false.type_check(s):
+            return None
+        return true_type
+
 
 class Assignment(Expression):
     __slots__ = 'location', 'value'
@@ -728,23 +803,31 @@ class Assignment(Expression):
         location = self.location
         value = self.value
         if type(location) is not Location:
-            # Should never happen? All locations are literals
-            # Maybe allow extension where (if ... then ... else ...)
-            # can evaluate to locations
+            # Extension rule: Using new type Location, which can be
+            # in (if ... then l1 else l2) if options.allow_conditional_locations
             location, s = location.step(s)
             return Assignment(location, value, self.options), s
         if type(value) is not Integer:
             value, s = value.step(s)
             return Assignment(location, value, self.options), s  # (assign2)
         l = location.value
-        if not self.options.allow_assignment_to_create_new_location and l not in s:
-            s[l] = value.value  # Throw error
-            assert False
+        if l not in s:
+            if not self.options.all_locations_implicitly_zero:
+                s[l] = value.value  # Throw error
+                assert False
+            s = s.copy()
+            s.mappings[l] = 0
+            return self, s  # (assign')
         return Skip(self.options), s + (l, value.value)  # (assign1)
+
+    @staticmethod
+    def _type_from_options(options):
+        return Type.INTEGER if options.assign_returns_new_value else Type.UNIT
 
     @classmethod
     def parse(cls, source, start_index, except_, allow_types, options):
-        if Type.UNIT not in allow_types:
+        T = Assignment._type_from_options(options)
+        if T not in allow_types:
             return None
         location = Expression.parse(source, start_index, except_, {Type.LOCATION}, options)
         if location is None:
@@ -752,7 +835,7 @@ class Assignment(Expression):
         location, start_index = location
         if source[start_index: start_index+2] != ':=':
             return None
-        value = Expression.parse(source, start_index + 2, None, {Type.INTEGER}, options)
+        value = Expression.parse(source, start_index + 2, None, {T}, options)
         if value is None:
             return None
         value, start_index = value
@@ -775,7 +858,7 @@ class Assignment(Expression):
         return f'{self.location} := {self.value}'
 
     def get_type(self):
-        return Type.INTEGER if self.options.assign_returns_new_value else Type.UNIT
+        return Assignment._type_from_options(self.options)
 
     def __eq__(self, other):
         eq = super().__eq__(other)
@@ -788,6 +871,13 @@ class Assignment(Expression):
         self.location.visit(f)
         self.value.visit(f)
 
+    def type_check(self, s):
+        if self.location.type_check(s) is not Type.LOCATION:
+            return None
+        if self.value.type_check(s) is not Type.INTEGER:
+            return None
+        return self.get_type()
+
 
 class Dereference(Expression):
     __slots__ = 'location',
@@ -799,12 +889,14 @@ class Dereference(Expression):
     def step(self, s):
         location = self.location
         if type(location) is not Location:
-            # Never happens normally (location should be a fixed Location)
+            # Only happens if options.allow_conditional_locations
             location, s = location.step(s)
             return Dereference(location, self.options), s
         l = location.value
         if self.options.all_locations_implicitly_zero and l not in s:
-            return Integer(0, self.options), s
+            s = s.copy()
+            s.mappings[l] = 0
+            return self, s  # (deref')
         return Integer(s[l], self.options), s  # (deref)
 
     @classmethod
@@ -848,6 +940,11 @@ class Dereference(Expression):
     def visit(self, f):
         super().visit(f)
         self.location.visit(f)
+
+    def type_check(self, s):
+        if self.location.type_check(s) is not Type.LOCATION:
+            return None
+        return Type.INTEGER
 
 
 class Location(Expression):
@@ -895,6 +992,11 @@ class Location(Expression):
             return self.value == other.value
         return eq
 
+    def type_check(self, s):
+        if not self.options.all_locations_implicitly_zero and self.value not in s:
+            return None
+        return Type.LOCATION
+
 
 class Skip(Expression):
     __slots__ = ()
@@ -932,6 +1034,9 @@ class Skip(Expression):
 
     def __eq__(self, other):
         return super().__eq__(other)
+
+    def type_check(self, s):
+        return Type.UNIT
 
 
 class WhileLoop(Expression):
@@ -997,6 +1102,12 @@ class WhileLoop(Expression):
         self.condition.visit(f)
         self.body.visit(f)
 
+    def type_check(self, s):
+        if self.condition.type_check(s) is not Type.BOOLEAN:
+            return None
+        if self.body.type_check(s) is not Type.UNIT:
+            return None
+
 
 class Parenthesised(Expression):
     __slots__ = 'expression',
@@ -1046,8 +1157,11 @@ class Parenthesised(Expression):
         super().visit(f)
         self.expression.visit(f)
 
+    def type_check(self, s):
+        return self.expression.type_check(s)
 
-def parse_source(source: str, automatic_zeros=None, options=Options()):
+
+def parse_source(source: str, options=Options()):
     if source[0: 2] == '#!':
         try:
             source = source[source.index('\n') + 1:]
@@ -1122,20 +1236,6 @@ def parse_source(source: str, automatic_zeros=None, options=Options()):
             source = source[next_line + 1: ]
 
     e = Expression.create(source, options=options)
-
-    if automatic_zeros is not None and automatic_zeros is not False:
-        if automatic_zeros is True:
-            automatic_zeros = 0
-        else:
-            automatic_zeros = int(automatic_zeros)
-        all_locations = set()
-        def visitor(e):
-            if type(e) == Location:
-                all_locations.add(e.value)
-        e.visit(visitor)
-        zeroed = dict.fromkeys(all_locations, automatic_zeros)
-        zeroed.update(s.mappings)
-        s.mappings = zeroed
 
     return e, s
 
